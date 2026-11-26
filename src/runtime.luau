@@ -1,0 +1,422 @@
+-- Rayfield Gen2 + owner/driver-gated client vehicle controls.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Input = game:GetService("UserInputService")
+local Storage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+assert(player, "Run this script on the client")
+assert(type(loadstring) == "function", "This build needs an environment with loadstring and game:HttpGet")
+local loaded, Rayfield = pcall(function()
+    local source = game:HttpGet("https://sirius.menu/gen2")
+    local chunk, reason = loadstring(source)
+    assert(chunk, reason)
+    return chunk()
+end)
+assert(loaded and type(Rayfield) == "table", "Rayfield Gen2 could not load: " .. tostring(Rayfield))
+
+local playerGui = player:WaitForChild("PlayerGui")
+local old = playerGui:FindFirstChild("RoadsterClientPanel")
+if old then
+    local signal = old:FindFirstChild("Shutdown")
+    if signal and signal:IsA("BindableEvent") then signal:Fire() end
+    old:Destroy()
+end
+local function create(class, properties, parent)
+    local object = Instance.new(class)
+    for key, value in pairs(properties) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+local gui = create("ScreenGui", { Name = "RoadsterClientPanel", ResetOnSpawn = false }, playerGui)
+local shutdown = create("BindableEvent", { Name = "Shutdown" }, gui)
+local connections, markers, controls = {}, {}, {}
+local alive, window, cameraBackup = true, nil, nil
+local car, chassis, seat, policeList, missionList = nil, nil, nil, {}, {}
+local physicsError = nil
+local flightForce, flightAttachment = nil, nil
+local overrides = Core.newOverrides()
+local state = {
+    speed = false, topSpeed = 180, acceleration = 100,
+    boost = false, boostMultiplier = 1.5,
+    grip = false, gripStrength = 4,
+    flight = false, flySpeed = 100, vertical = "Neutral",
+    attributes = false, attrAccel = 50, attrGrip = 1.22, attrBoost = 1, attrRide = 1.85,
+    police = false, missions = false, throughWalls = false, markerRange = 2000,
+    camera = "Game", fov = 70, cameraDistance = 24,
+}
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+local function restoreCamera()
+    if not cameraBackup then return end
+    local backup = cameraBackup
+    cameraBackup = nil
+    pcall(function()
+        backup.camera.CameraType = backup.kind
+        if backup.subject and backup.subject.Parent then backup.camera.CameraSubject = backup.subject
+        elseif player.Character then backup.camera.CameraSubject = player.Character:FindFirstChildOfClass("Humanoid") end
+        backup.camera.FieldOfView = backup.fov
+        backup.camera.CFrame = backup.cframe
+        backup.camera.Focus = backup.focus
+    end)
+end
+local function clearMarkers()
+    for object, marker in pairs(markers) do marker.gui:Destroy(); markers[object] = nil end
+end
+local function clearFlight()
+    if flightForce then flightForce:Destroy(); flightForce = nil end
+    if flightAttachment then flightAttachment:Destroy(); flightAttachment = nil end
+end
+local function destroy()
+    if not alive then return end
+    alive = false
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    pcall(function() overrides:restore() end)
+    restoreCamera()
+    clearFlight()
+    clearMarkers()
+    if window and not window.unloaded then pcall(function() window:Unload() end) end
+    gui:Destroy()
+end
+connect(shutdown.Event, destroy)
+connect(gui.Destroying, destroy)
+local function driving()
+    if not car or not chassis or not seat or not car:IsDescendantOf(workspace)
+        or not chassis:IsDescendantOf(car) or not seat:IsDescendantOf(car) or chassis.Anchored then return false end
+    local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    return humanoid ~= nil and humanoid.Health > 0
+        and Core.canDrive(car:GetAttribute("Owner"), player.UserId, seat.Occupant, humanoid, humanoid.SeatPart, seat)
+end
+local function partFor(object)
+    if object:IsA("BasePart") then return object end
+    if object:IsA("Model") and object.PrimaryPart then return object.PrimaryPart end
+    return object:FindFirstChildWhichIsA("BasePart", true)
+end
+local function scan()
+    local found, foundPart, foundSeat = nil, nil, nil
+    policeList, missionList = {}, {}
+    local cars = workspace:FindFirstChild("Cars")
+    if cars then
+        for _, model in ipairs(cars:GetChildren()) do
+            if model:IsA("Model") and string.sub(model.Name, 1, 9) == "Roadster_"
+                and tostring(model:GetAttribute("Owner")) == tostring(player.UserId) then
+                found = model
+                local candidate = model:FindFirstChild("Chassis")
+                foundPart = candidate and candidate:IsA("BasePart") and candidate or model.PrimaryPart
+                candidate = model:FindFirstChild("DriverSeat", true)
+                foundSeat = candidate and (candidate:IsA("VehicleSeat") or candidate:IsA("Seat")) and candidate or nil
+                -- Prefer the occupied car if two owned vehicles briefly coexist.
+                if foundSeat and foundSeat.Occupant and foundSeat.Occupant.Parent == player.Character then break end
+            end
+        end
+        for _, model in ipairs(cars:GetChildren()) do
+            if string.sub(model.Name, 1, 7) == "Police_" then
+                local part = partFor(model)
+                if part then table.insert(policeList, { object = model, part = part, name = model.Name }) end
+            end
+        end
+    end
+    if found ~= car then overrides:restore(); restoreCamera(); clearFlight() end
+    car, chassis, seat = found, foundPart, foundSeat
+    for _, name in ipairs({ "MissionLocal", "MissionSpots" }) do
+        local folder = workspace:FindFirstChild(name)
+        if folder then
+            for _, object in ipairs(folder:GetChildren()) do
+                local part = partFor(object)
+                if part then table.insert(missionList, { object = object, part = part, name = name .. "/" .. object.Name }) end
+            end
+        end
+    end
+end
+local function key(code)
+    return not Input:GetFocusedTextBox() and Input:IsKeyDown(code) and 1 or 0
+end
+local function flatUnit(vector)
+    local flat = Vector3.new(vector.X, 0, vector.Z)
+    return flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+end
+local function throttle()
+    if Input:GetFocusedTextBox() then return 0 end
+    local keyboard = key(Enum.KeyCode.W) - key(Enum.KeyCode.S)
+    if keyboard ~= 0 then return keyboard end
+    return seat:IsA("VehicleSeat") and seat.ThrottleFloat or 0
+end
+local function physicsStep(dt)
+    if not driving() then overrides:restore(); clearFlight(); return end
+    if state.attributes then
+        overrides:apply(car, { Accel = state.attrAccel, GripScale = state.attrGrip,
+            BoostScale = state.attrBoost, RideHeight = state.attrRide })
+    else overrides:restore() end
+    local multiplier = state.boost and state.boostMultiplier or 1
+    if state.flight then
+        if flightForce and flightForce.Parent ~= chassis then clearFlight() end
+        if not flightForce then
+            flightAttachment = create("Attachment", { Name = "RoadsterHubFlight" }, chassis)
+            flightForce = create("VectorForce", { Name = "RoadsterHubLift", Attachment0 = flightAttachment,
+                RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true }, chassis)
+        end
+        flightForce.Force = Vector3.new(0, workspace.Gravity * chassis.AssemblyMass, 0)
+        local camera = workspace.CurrentCamera
+        local forward = flatUnit(camera and camera.CFrame.LookVector or chassis.CFrame.LookVector)
+        local right = Vector3.new(-forward.Z, 0, forward.X)
+        local lateral = key(Enum.KeyCode.D) - key(Enum.KeyCode.A)
+        if lateral == 0 and not Input:GetFocusedTextBox() and seat:IsA("VehicleSeat") then lateral = seat.SteerFloat end
+        local vertical = key(Enum.KeyCode.Space) - key(Enum.KeyCode.LeftControl)
+        if not Input:GetFocusedTextBox() then
+            if state.vertical == "Up" then vertical = 1 elseif state.vertical == "Down" then vertical = -1 end
+        end
+        local direction = forward * throttle() + right * lateral + Vector3.new(0, vertical, 0)
+        if direction.Magnitude > 1 then direction = direction.Unit end
+        chassis.AssemblyLinearVelocity = direction * state.flySpeed * multiplier
+        chassis.AssemblyAngularVelocity = Vector3.zero
+    else
+        clearFlight()
+        if not state.speed and not state.grip then return end
+        local velocity = chassis.AssemblyLinearVelocity
+        local forward = flatUnit(chassis.CFrame.LookVector)
+        local planar = Vector3.new(velocity.X, 0, velocity.Z)
+        local longitudinal = planar:Dot(forward)
+        local sideways = planar - forward * longitudinal
+        if state.speed then
+            longitudinal = Core.stepSpeed(longitudinal, throttle(), state.acceleration * multiplier, state.topSpeed * multiplier, dt)
+        end
+        if state.grip then sideways = sideways * Core.gripFactor(state.gripStrength, dt) end
+        chassis.AssemblyLinearVelocity = forward * longitudinal + sideways + Vector3.new(0, velocity.Y, 0)
+    end
+end
+local function notify(message)
+    if window and not window.unloaded then window:Notify({ title = "Roadster", content = message }) end
+end
+local function action(callback)
+    return function()
+        if not driving() then notify("Enter the driver seat of your Roadster first."); return end
+        local ok, err = pcall(callback)
+        if not ok then notify("Vehicle action failed: " .. tostring(err)) end
+    end
+end
+local function setState(name, value)
+    state[name] = value
+    if controls[name] then controls[name]:Set(value, true) end
+end
+local function stopFeatures()
+    for _, name in ipairs({ "speed", "boost", "grip", "flight", "attributes", "police", "missions" }) do setState(name, false) end
+    setState("camera", "Game")
+    setState("vertical", "Neutral")
+    overrides:restore()
+    clearFlight()
+    restoreCamera()
+    clearMarkers()
+end
+local function toggle(tab, name, flag, description)
+    controls[flag] = tab:CreateToggle({ name = name, flag = flag, value = state[flag], forgetState = true,
+        description = description, callback = function(value)
+            state[flag] = value
+            physicsError = nil
+            if flag == "attributes" and not value then overrides:restore() end
+            if flag == "flight" then
+                setState("vertical", "Neutral")
+                if not value then clearFlight() end
+            end
+            if (flag == "police" or flag == "missions") and not value then clearMarkers() end
+        end })
+end
+local function slider(tab, name, flag, minimum, maximum, increment, suffix)
+    controls[flag] = tab:CreateSlider({ name = name, flag = flag, range = { minimum, maximum },
+        increment = increment, value = state[flag], suffix = suffix, forgetState = true,
+        callback = function(value) state[flag] = Core.clamp(value, minimum, maximum) end })
+end
+local telemetry, status, policeText, missionText, raceText
+local function buildUI()
+    window = Rayfield:CreateWindow({ name = "Roadster Hub", subtitle = "Vehicle tuning • v0.2",
+        sidebarLayout = true, theme = "rose", showName = "Roadster",
+        configuration = { autoSave = false, autoLoad = false } })
+    local vehicle = window:CreateTab({ name = "Vehicle" })
+    local tune = window:CreateTab({ name = "Tuning" })
+    local flight = window:CreateTab({ name = "Flight" })
+    local camera = window:CreateTab({ name = "Camera" })
+    local police = window:CreateTab({ name = "Police" })
+    local missions = window:CreateTab({ name = "Missions" })
+    local settings = window:CreateTab({ name = "Settings" })
+    status = vehicle:CreateText({ name = "Control status", text = "Finding your Roadster…" })
+    telemetry = vehicle:CreateText({ name = "Live telemetry", text = "Waiting for streamed vehicle data." })
+    vehicle:CreateButton({ name = "Brake now", callback = action(function()
+        local v = chassis.AssemblyLinearVelocity
+        chassis.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+        chassis.AssemblyAngularVelocity = Vector3.zero
+    end) })
+    vehicle:CreateButton({ name = "Recover upright", callback = action(function()
+        local forward = flatUnit(chassis.CFrame.LookVector)
+        local position = chassis.Position + Vector3.new(0, 4, 0)
+        local target = CFrame.lookAt(position, position + forward)
+        car:PivotTo(target * chassis.CFrame:Inverse() * car:GetPivot())
+        chassis.AssemblyLinearVelocity = Vector3.zero
+        chassis.AssemblyAngularVelocity = Vector3.zero
+    end) })
+    vehicle:CreateButton({ name = "Disable all features / restore overrides", callback = stopFeatures })
+    tune:CreateSection({ name = "Driving assist" })
+    toggle(tune, "Speed assist", "speed", "Uses your throttle and modifies velocity while you drive.")
+    slider(tune, "Forward / reverse target speed", "topSpeed", 20, 500, 5, " studs/s")
+    slider(tune, "Assist acceleration", "acceleration", 10, 500, 5, " studs/s²")
+    toggle(tune, "Boost multiplier", "boost", "Multiplies speed-assist and flight speed/acceleration. Enable one of those modes first.")
+    slider(tune, "Boost multiplier", "boostMultiplier", 1, 3, 0.1, "x")
+    toggle(tune, "Grip assist", "grip", "Reduces sideways sliding without changing vertical velocity.")
+    slider(tune, "Grip strength", "gripStrength", 0, 20, 0.5, " /s")
+    tune:CreateSection({ name = "Experimental game attributes" })
+    tune:CreateText({ text = "These attributes were observed on your car. Effects depend on the game's controller; they are not verified upgrade unlocks. Original values are restored when disabled or you leave the seat." })
+    toggle(tune, "Override vehicle attributes", "attributes")
+    slider(tune, "Acceleration attribute", "attrAccel", 1, 500, 1)
+    slider(tune, "GripScale attribute", "attrGrip", 0.1, 5, 0.01)
+    slider(tune, "BoostScale attribute", "attrBoost", 1, 5, 0.1)
+    slider(tune, "RideHeight attribute", "attrRide", 0.5, 5, 0.05)
+    toggle(flight, "Vehicle flight", "flight", "Takes priority over speed/grip assist. Requires your occupied driver seat.")
+    slider(flight, "Flight speed", "flySpeed", 10, 300, 5, " studs/s")
+    controls.vertical = flight:CreateDropdown({ name = "Vertical movement", options = { "Neutral", "Up", "Down" },
+        value = "Neutral", forgetState = true, callback = function(value) state.vertical = value end })
+    flight:CreateText({ text = "WASD: camera-relative flight. Space: rise. Left Ctrl: descend. Release movement to hover. On touch/controller, vehicle throttle/steering and the vertical dropdown provide input. Disabling flight returns to normal physics; momentum is not rewound." })
+    controls.camera = camera:CreateDropdown({ name = "Camera mode", options = { "Game", "Chase", "Overhead" },
+        value = "Game", forgetState = true, callback = function(value)
+            state.camera = value
+            if value == "Game" then restoreCamera() end
+        end })
+    slider(camera, "Panel camera field of view", "fov", 40, 110, 1, "°")
+    slider(camera, "Camera distance", "cameraDistance", 10, 100, 1, " studs")
+    camera:CreateButton({ name = "Restore game camera", callback = function() setState("camera", "Game"); restoreCamera() end })
+    toggle(police, "Police markers", "police")
+    policeText = police:CreateText({ name = "Nearest police", text = "Waiting…" })
+    police:CreateText({ text = "Only streamed vehicles are listed. Distance does not establish which police are chasing you." })
+    toggle(missions, "Mission markers", "missions")
+    missionText = missions:CreateText({ name = "Mission objects", text = "Waiting…" })
+    raceText = missions:CreateText({ name = "Race state", text = "Waiting…" })
+    missions:CreateText({ text = "Tracks client-visible objects and raw race values. Mission acceptance, payouts and completion are not wired: their remote arguments and server rules are unknown." })
+    toggle(settings, "Markers through walls", "throughWalls")
+    slider(settings, "Marker range", "markerRange", 100, 5000, 100, " studs")
+    settings:CreateDropdown({ name = "Theme", options = { "rose", "default", "cobalt", "ember", "amethyst", "frost" },
+        value = "rose", forgetState = true, callback = function(value) window:ChangeTheme(value) end })
+    settings:CreateText({ name = "Session controls", text = "Right Ctrl: hide/show. End: unload. All vehicle modifications start disabled. Physics changes may replicate when your client owns the car, and the server may correct them." })
+    settings:CreateButton({ name = "Disable all features / restore overrides", callback = stopFeatures })
+    settings:CreateButton({ name = "Unload hub", callback = destroy })
+end
+local okUI, errorUI = pcall(buildUI)
+if not okUI then destroy(); error("Rayfield setup failed: " .. tostring(errorUI)) end
+
+local function origin()
+    if chassis and chassis.Parent then return chassis.Position end
+    local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    return root and root.Position or nil
+end
+local function sortedAvailable(entries)
+    local result, position = {}, origin()
+    for _, entry in ipairs(entries) do
+        if entry.part:IsDescendantOf(workspace) then
+            table.insert(result, { object = entry.object, part = entry.part, name = entry.name,
+                distance = position and (entry.part.Position - position).Magnitude or math.huge })
+        end
+    end
+    table.sort(result, function(a, b) return a.distance < b.distance end)
+    return result
+end
+local function updateList(entries, enabled, limit, color, wanted)
+    local lines = {}
+    for index, entry in ipairs(entries) do
+        if index > limit then break end
+        local distance = entry.distance == math.huge and "unknown" or string.format("%.0f studs", entry.distance)
+        local text = entry.name .. " • " .. distance
+        table.insert(lines, text)
+        if enabled and entry.distance <= state.markerRange then
+            wanted[entry.object] = true
+            local marker = markers[entry.object]
+            if not marker then
+                local billboard = create("BillboardGui", { Name = "RoadsterMarker", Size = UDim2.fromOffset(240, 44),
+                    StudsOffsetWorldSpace = Vector3.new(0, 5, 0) }, gui)
+                local label = create("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+                    Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = color,
+                    TextStrokeTransparency = 0.3, TextWrapped = true, RichText = false }, billboard)
+                marker = { gui = billboard, label = label }; markers[entry.object] = marker
+            end
+            marker.gui.Adornee = entry.part
+            marker.gui.AlwaysOnTop = state.throughWalls
+            marker.gui.MaxDistance = state.markerRange
+            marker.label.Text = text
+        end
+    end
+    return #lines > 0 and table.concat(lines, "\n") or "No matching objects currently streamed."
+end
+local function attr(name)
+    local value = car and car:GetAttribute(name)
+    return value == nil and "unavailable" or tostring(value)
+end
+local function refresh()
+    local controlling = driving()
+    status:Set(physicsError and "Control error: " .. physicsError or (controlling
+        and "Your driver seat is active. Enable features in Tuning / Flight."
+        or "Vehicle modifications paused: enter your Roadster's driver seat."))
+    if car and chassis and car.Parent and chassis.Parent then
+        telemetry:Set(string.format("%s\nSpeed: %.1f studs/s | Gear: %s\nEngine: %s | BoostActive: %s\nAccel: %s | GripScale: %s | BoostScale: %s\nRideHeight: %s | Flying attribute: %s\nAssist: %s | Flight: %s",
+            car.Name, chassis.AssemblyLinearVelocity.Magnitude, attr("Gear"), attr("Engine"), attr("BoostActive"),
+            attr("Accel"), attr("GripScale"), attr("BoostScale"), attr("RideHeight"), attr("Flying"),
+            tostring(state.speed and controlling), tostring(state.flight and controlling)))
+    else telemetry:Set("Your Roadster is not currently streamed. Spawn it using the game's controls.") end
+    local wanted = {}
+    local police = sortedAvailable(policeList)
+    policeText:Set("Streamed police: " .. #police .. "\n" .. updateList(police, state.police, 12, Color3.fromRGB(98, 171, 255), wanted))
+    missionText:Set(updateList(sortedAvailable(missionList), state.missions, 8, Color3.fromRGB(255, 59, 127), wanted))
+    for object, marker in pairs(markers) do
+        if not wanted[object] then marker.gui:Destroy(); markers[object] = nil end
+    end
+    local race, values = Storage:FindFirstChild("RaceState"), {}
+    if race then
+        for name, value in pairs(race:GetAttributes()) do table.insert(values, name .. " = " .. tostring(value)) end
+        for _, child in ipairs(race:GetChildren()) do
+            if child:IsA("ValueBase") then table.insert(values, child.Name .. " = " .. tostring(child.Value)) end
+        end
+        table.sort(values)
+    end
+    while #values > 20 do table.remove(values) end
+    raceText:Set(#values > 0 and table.concat(values, "\n") or "No readable RaceState values currently available.")
+end
+connect(Input.InputBegan, function(input, processed)
+    if processed or Input:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.RightControl then window:ToggleHide() end
+    if input.KeyCode == Enum.KeyCode.End then destroy() end
+end)
+connect(RunService.PreSimulation, function(dt)
+    if window.unloaded then destroy(); return end
+    local ok, err = pcall(physicsStep, dt)
+    if not ok then
+        physicsError = tostring(err)
+        pcall(stopFeatures)
+    end
+end)
+local elapsed, scanElapsed = 1, 1
+connect(RunService.Heartbeat, function(dt)
+    if window.unloaded then destroy(); return end
+    elapsed, scanElapsed = elapsed + dt, scanElapsed + dt
+    if elapsed < 0.25 then return end
+    elapsed = 0
+    local ok, err = pcall(function()
+        if scanElapsed >= 1 then scanElapsed = 0; scan() end
+        refresh()
+    end)
+    if not ok then status:Set("Read error: " .. tostring(err)) end
+end)
+connect(RunService.RenderStepped, function()
+    if window.unloaded then destroy(); return end
+    if state.camera == "Game" then return end
+    local camera = workspace.CurrentCamera
+    if not camera or not chassis or not chassis:IsDescendantOf(workspace) then restoreCamera(); return end
+    if cameraBackup and cameraBackup.camera ~= camera then restoreCamera() end
+    if not cameraBackup then
+        cameraBackup = { camera = camera, kind = camera.CameraType, subject = camera.CameraSubject,
+            fov = camera.FieldOfView, cframe = camera.CFrame, focus = camera.Focus }
+    end
+    local target = chassis.Position
+    local offset = state.camera == "Overhead" and Vector3.new(0, state.cameraDistance * 2, 0.1)
+        or -flatUnit(chassis.CFrame.LookVector) * state.cameraDistance + Vector3.new(0, 9, 0)
+    camera.CameraType = Enum.CameraType.Scriptable
+    camera.FieldOfView = state.fov
+    camera.CFrame = CFrame.lookAt(target + offset, target)
+    camera.Focus = CFrame.new(target)
+end)
+notify("Ready. Enter your Roadster, then enable Speed assist in Tuning. End unloads the hub.")
