@@ -35,6 +35,8 @@ local car, chassis, seat, policeList, missionList = nil, nil, nil, {}, {}
 local physicsError = nil
 local flightForce, flightAttachment = nil, nil
 local overrides = Core.newOverrides()
+local coinRoute = Core.newCoinRoute()
+local coinPoints, coinElapsed = {}, 1
 local state = {
     speed = false, topSpeed = 180, acceleration = 100,
     boost = false, boostMultiplier = 1.5,
@@ -43,6 +45,7 @@ local state = {
     attributes = false, attrAccel = 50, attrGrip = 1.22, attrBoost = 1, attrRide = 1.85,
     police = false, missions = false, throughWalls = false, markerRange = 2000,
     camera = "Game", fov = 70, cameraDistance = 24,
+    farm = false, farmSpeed = 60,
 }
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
@@ -68,6 +71,15 @@ end
 local function clearFlight()
     if flightForce then flightForce:Destroy(); flightForce = nil end
     if flightAttachment then flightAttachment:Destroy(); flightAttachment = nil end
+end
+local function ensureLift()
+    if flightForce and flightForce.Parent ~= chassis then clearFlight() end
+    if not flightForce then
+        flightAttachment = create("Attachment", { Name = "RoadsterHubFlight" }, chassis)
+        flightForce = create("VectorForce", { Name = "RoadsterHubLift", Attachment0 = flightAttachment,
+            RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true }, chassis)
+    end
+    flightForce.Force = Vector3.new(0, workspace.Gravity * chassis.AssemblyMass, 0)
 end
 local function destroy()
     if not alive then return end
@@ -118,7 +130,11 @@ local function scan()
             end
         end
     end
-    if found ~= car then overrides:restore(); restoreCamera(); clearFlight() end
+    if found ~= car then
+        overrides:restore(); restoreCamera(); clearFlight()
+        coinRoute:pause("Vehicle changed")
+        coinPoints, coinElapsed = {}, 1
+    end
     car, chassis, seat = found, foundPart, foundSeat
     for _, name in ipairs({ "MissionLocal", "MissionSpots" }) do
         local folder = workspace:FindFirstChild(name)
@@ -144,20 +160,50 @@ local function throttle()
     return seat:IsA("VehicleSeat") and seat.ThrottleFloat or 0
 end
 local function physicsStep(dt)
-    if not driving() then overrides:restore(); clearFlight(); return end
+    if not driving() then
+        overrides:restore(); clearFlight(); coinRoute:pause("Enter your Roadster's driver seat")
+        return
+    end
     if state.attributes then
         overrides:apply(car, { Accel = state.attrAccel, GripScale = state.attrGrip,
             BoostScale = state.attrBoost, RideHeight = state.attrRide })
     else overrides:restore() end
     local multiplier = state.boost and state.boostMultiplier or 1
-    if state.flight then
-        if flightForce and flightForce.Parent ~= chassis then clearFlight() end
-        if not flightForce then
-            flightAttachment = create("Attachment", { Name = "RoadsterHubFlight" }, chassis)
-            flightForce = create("VectorForce", { Name = "RoadsterHubLift", Attachment0 = flightAttachment,
-                RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true }, chassis)
+    if state.farm then
+        if player:GetAttribute("ClientMode") ~= "Driving" then
+            coinRoute:pause("Waiting for the game's Driving mode")
+            clearFlight()
+            return
         end
-        flightForce.Force = Vector3.new(0, workspace.Gravity * chassis.AssemblyMass, 0)
+        ensureLift()
+        if Input:GetFocusedTextBox() then
+            coinRoute:pause("Paused while typing")
+            chassis.AssemblyLinearVelocity = Vector3.zero
+            return
+        end
+        coinElapsed = coinElapsed + dt
+        if coinElapsed >= 0.1 then
+            coinElapsed, coinPoints = 0, {}
+            local folder = workspace:FindFirstChild("LocalCoins")
+            if folder then
+                for _, part in ipairs(folder:GetChildren()) do
+                    if part.Name == "Coin" and part:IsA("BasePart") then table.insert(coinPoints, part.Position) end
+                end
+            end
+        end
+        local point = coinRoute:step(coinPoints, chassis.Position, os.clock())
+        local velocity = Vector3.zero
+        if point then
+            local delta = point - chassis.Position
+            if delta.Magnitude > 0.1 then
+                -- Slow near the coin; stay in range long enough for RenderStepped pickup.
+                velocity = delta.Unit * math.min(state.farmSpeed, delta.Magnitude * 2)
+            end
+        end
+        chassis.AssemblyLinearVelocity = velocity
+        chassis.AssemblyAngularVelocity = Vector3.zero
+    elseif state.flight then
+        ensureLift()
         local camera = workspace.CurrentCamera
         local forward = flatUnit(camera and camera.CFrame.LookVector or chassis.CFrame.LookVector)
         local right = Vector3.new(-forward.Z, 0, forward.X)
@@ -201,7 +247,8 @@ local function setState(name, value)
     if controls[name] then controls[name]:Set(value, true) end
 end
 local function stopFeatures()
-    for _, name in ipairs({ "speed", "boost", "grip", "flight", "attributes", "police", "missions" }) do setState(name, false) end
+    for _, name in ipairs({ "speed", "boost", "grip", "flight", "attributes", "police", "missions", "farm" }) do setState(name, false) end
+    coinRoute:pause("Disabled")
     setState("camera", "Game")
     setState("vertical", "Neutral")
     overrides:restore()
@@ -216,8 +263,17 @@ local function toggle(tab, name, flag, description)
             physicsError = nil
             if flag == "attributes" and not value then overrides:restore() end
             if flag == "flight" then
+                if value then setState("farm", false); coinRoute:pause("Manual flight selected") end
                 setState("vertical", "Neutral")
                 if not value then clearFlight() end
+            end
+            if flag == "farm" then
+                coinRoute:pause(value and "Starting" or "Disabled")
+                coinPoints, coinElapsed = {}, 1
+                clearFlight()
+                if value then
+                    for _, mode in ipairs({ "speed", "boost", "grip", "flight" }) do setState(mode, false) end
+                end
             end
             if (flag == "police" or flag == "missions") and not value then clearMarkers() end
         end })
@@ -227,14 +283,15 @@ local function slider(tab, name, flag, minimum, maximum, increment, suffix)
         increment = increment, value = state[flag], suffix = suffix, forgetState = true,
         callback = function(value) state[flag] = Core.clamp(value, minimum, maximum) end })
 end
-local telemetry, status, policeText, missionText, raceText
+local telemetry, status, policeText, missionText, raceText, farmText
 local function buildUI()
-    window = Rayfield:CreateWindow({ name = "Roadster Hub", subtitle = "Vehicle tuning • v0.2",
+    window = Rayfield:CreateWindow({ name = "Roadster Hub", subtitle = "Vehicle tuning • v0.3",
         sidebarLayout = true, theme = "rose", showName = "Roadster",
         configuration = { autoSave = false, autoLoad = false } })
     local vehicle = window:CreateTab({ name = "Vehicle" })
     local tune = window:CreateTab({ name = "Tuning" })
     local flight = window:CreateTab({ name = "Flight" })
+    local farm = window:CreateTab({ name = "Farm" })
     local camera = window:CreateTab({ name = "Camera" })
     local police = window:CreateTab({ name = "Police" })
     local missions = window:CreateTab({ name = "Missions" })
@@ -275,6 +332,14 @@ local function buildUI()
     controls.vertical = flight:CreateDropdown({ name = "Vertical movement", options = { "Neutral", "Up", "Down" },
         value = "Neutral", forgetState = true, callback = function(value) state.vertical = value end })
     flight:CreateText({ text = "WASD: camera-relative flight. Space: rise. Left Ctrl: descend. Release movement to hover. On touch/controller, vehicle throttle/steering and the vertical dropdown provide input. Disabling flight returns to normal physics; momentum is not rewound." })
+    toggle(farm, "Auto collect visible coins", "farm", "Moves your occupied Roadster to visible coins. Requires an active coin objective; the game handles pickup.")
+    slider(farm, "Collection travel speed", "farmSpeed", 10, 120, 5, " studs/s")
+    farmText = farm:CreateText({ name = "Collection status", text = "Disabled" })
+    farm:CreateText({ name = "Coin quest payouts", text = "Easy: 5 coins / base 1,000 cash. Medium: 20 / base 4,000. Hard: 60 / base 10,000. Actual rewards are adjusted by MoneyScale and game rules. Claim completed quests in the game's menu." })
+    farm:CreateText({ text = "Direct flight to the nearby rendered coin pool; no obstacle routing or full-map search. Stalled targets are skipped. Waiting with no coins holds position until you disable the collector. Local coin disappearance is not server-confirmed progress or cash. This hub does not send coin claims or auto-claim quest rewards." })
+    farm:CreateButton({ name = "Stop collection", callback = function()
+        setState("farm", false); coinRoute:pause("Disabled"); clearFlight()
+    end })
     controls.camera = camera:CreateDropdown({ name = "Camera mode", options = { "Game", "Chase", "Overhead" },
         value = "Game", forgetState = true, callback = function(value)
             state.camera = value
@@ -358,6 +423,10 @@ local function refresh()
             attr("Accel"), attr("GripScale"), attr("BoostScale"), attr("RideHeight"), attr("Flying"),
             tostring(state.speed and controlling), tostring(state.flight and controlling)))
     else telemetry:Set("Your Roadster is not currently streamed. Spawn it using the game's controls.") end
+    farmText:Set((state.farm and coinRoute.message or "Disabled")
+        .. "\nVisible candidates: " .. #coinPoints
+        .. "\nNearby disappearances observed: " .. coinRoute.observed
+        .. "\nQuest progress and cash: check the game's HUD")
     local wanted = {}
     local police = sortedAvailable(policeList)
     policeText:Set("Streamed police: " .. #police .. "\n" .. updateList(police, state.police, 12, Color3.fromRGB(98, 171, 255), wanted))

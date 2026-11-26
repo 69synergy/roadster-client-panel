@@ -1,6 +1,6 @@
 # Roadster Hub — Rayfield Gen2
 
-Version 0.2 for Tesla Roadster Chase (place `122379697375766`). Uses the official [Rayfield Gen2 stable loader](https://docs.sirius.menu/rayfield-gen2/getting-started), with a rose theme and sidebar tabs.
+Version 0.3 for Tesla Roadster Chase (place `122379697375766`). Uses the official [Rayfield Gen2 stable loader](https://docs.sirius.menu/rayfield-gen2/getting-started), with a rose theme and sidebar tabs.
 
 ## Run
 
@@ -22,6 +22,7 @@ Enter your own Roadster's driver seat, open **Tuning**, set the target speed and
 | Tuning | Throttle-based speed assist, target speed, acceleration, boost multiplier, sideways grip damping |
 | Tuning / experimental | Reversible `Accel`, `GripScale`, `BoostScale`, and `RideHeight` overrides |
 | Flight | Vehicle flight/hover, speed, keyboard or seat throttle/steering, vertical dropdown |
+| Farm | Automatic movement to nearby visible coins, travel-speed slider, stall timeout and stop control |
 | Camera | Game/chase/overhead modes, FOV, distance, reset |
 | Police | Nearest streamed police vehicles, distances, optional markers |
 | Missions | Nearby mission objects, optional markers, raw client-visible RaceState |
@@ -30,6 +31,16 @@ Enter your own Roadster's driver seat, open **Tuning**, set the target speed and
 Speed assist adjusts forward/reverse velocity toward your selected target while throttle is held; releasing throttle leaves normal coasting, capped to the selected longitudinal target. Grip assistance dampens sideways motion. Normal driving preserves vertical velocity. Speed units are **studs/second**, not an assumed mph/km/h conversion. The boost multiplier applies to speed assist and flight; it does not unlock the game's boost upgrade.
 
 Flight takes priority over speed/grip assistance. WASD moves relative to the camera, Space rises, Left Ctrl descends, and neutral input hovers using a local gravity-compensating force. On touch/controller, seat throttle and steering plus the vertical dropdown provide input if the game's seat exposes those values. Normal gravity resumes on disable. Existing vehicle controllers may interfere with this behavior.
+
+## Coin quest collection
+
+Enter your own Roadster with an active coin objective, then open **Farm → Auto collect visible coins**. The collector flies directly toward the closest rendered `LocalCoins/Coin`, slows near it, and lets the game's existing CoinController handle proximity collection. It ignores `CoinSparkle`, handles pooled coin visuals changing locations, skips stalled/unconfirmed targets for 30 seconds, pauses outside the game's Driving mode, and removes its lift when disabled or you leave the driver seat. Enabling it disables manual speed/grip/boost/flight controls; selecting manual flight disables collection.
+
+The inspected progression config defines coin quests with **5 / 20 / 60** targets and **1,000 / 4,000 / 10,000** base cash rewards. Rewards are scaled/rounded using `Config.MoneyScale`; these are not verified final payouts. Coin visibility is gated by incomplete eligible coin objectives, including career progression after starter gating. Quest renewal is configured for 7,200 seconds after claiming, so this is not an unlimited cash loop.
+
+**Claim rewards manually in the game's quest menu.** No claim protocol has been established. The collector does not invoke game modules, send remotes, grant cash or spoof quest progress. Its disappearance counter is a local observation, not server confirmation.
+
+Only the nearby rendered pool is available (configured draw range 450 studs, pool size 12 desktop / 8 phone). There is no obstacle routing, teleportation or full-map exploration. While enabled with no visible targets it holds position; disable it to resume normal movement and find another area. Physical collisions and server movement corrections can block the route. Actual coin payouts and live collection are unverified.
 
 ## Scope and limits
 
@@ -50,7 +61,7 @@ Our code downloads only the official Rayfield endpoint and does not execute game
 
 Run `npm ci`, then `npm run build` after source edits, followed by `npm test`. Tests reject a stale generated bundle. GitHub Actions runs the same tests.
 
-**Validation:** 11 tests cover syntax, source boundaries, acceleration/reverse/frame-time handling, grip damping, ownership/seat checks, nil/false attribute restoration, external attribute changes, and simulated runtime cleanup on seat exit/panic/rerun/unload. The Lua VM fixture is a small Roblox/Rayfield behavioral double, not a physics engine or renderer. Actual Roblox execution, Rayfield rendering and server compatibility have not been verified.
+**Validation:** 15 tests cover syntax, source boundaries, acceleration/reverse/frame-time handling, grip damping, ownership/seat checks, attribute restoration, coin targeting/pooling/timeouts, and simulated runtime cleanup. The Lua VM fixture is a small Roblox/Rayfield behavioral double, not a physics engine or renderer. Actual Roblox execution, Rayfield rendering and server compatibility have not been verified.
 
 ## In-game test sequence
 
@@ -61,3 +72,4 @@ Run `npm ci`, then `npm run build` after source edits, followed by `npm test`. T
 5. Record attributes before enabling experimental overrides. Disable them and verify restoration; repeat after changing vehicles.
 6. Test police/mission markers, camera reset, disable-all, End, rerun, and Rayfield's own unload action. Check that one hub remains and no controls continue after unload.
 7. Send a screenshot/error log and which controls work. Mission progression still needs observed state changes before it can be mapped accurately.
+8. With an active coin quest, enable collection near visible coins. Compare game quest progress to local disappearance observations, test stalled targets and stop, and claim a completed reward manually. Do not treat the local counter as money earned.

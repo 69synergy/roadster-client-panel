@@ -2,6 +2,37 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const run = require('./lua.cjs');
 const core = 'local Core = (function()\n' + fs.readFileSync('src/core.luau', 'utf8') + '\nend)()\n';
+test('coin route: selects nearest, tolerates bobbing, handles pooled relocation', () => run(core + `
+local origin = {X=0,Y=0,Z=0}
+local near, far = {X=10,Y=0,Z=0}, {X=100,Y=0,Z=0}
+local route = Core.newCoinRoute()
+assert(route:step({far,near}, origin, 0) == near)
+assert(route:step({far,{X=10,Y=0.5,Z=0}}, {X=5,Y=0,Z=0}, 1) == near)
+-- Coin has disappeared/recycled while the car was in pickup range.
+assert(route:step({far}, near, 1.2) == far)
+assert(route.observed == 1)
+route:pause()
+assert(route:step({near,far}, origin, 2) == far)
+route:pause()
+assert(route:step({near,far}, origin, 32) == near)
+`));
+test('coin route: no false pickup count for culling, skips stuck targets, waits when empty', () => run(core + `
+local origin = {X=0,Y=0,Z=0}
+local point = {X=100,Y=0,Z=0}
+local route = Core.newCoinRoute()
+route:step({point}, origin, 0)
+assert(route:step({}, origin, 1) == nil and route.observed == 0)
+route:pause()
+route:step({point}, origin, 32)
+assert(route:step({point}, origin, 37) == nil)
+assert(route:step({point}, origin, 38) == nil)
+assert(route.observed == 0)
+local close = {X=1,Y=0,Z=0}
+route:step({close}, origin, 40)
+route:step({close}, origin, 40.1)
+assert(route:step({close}, origin, 42.2) == nil)
+assert(route.observed == 0) -- sitting in range is not confirmation
+`));
 test('speed controller: acceleration, reverse, deadzone, lag cap, no overshoot', () => run(core + `
 assert(Core.stepSpeed(0, 1, 100, 180, 0.1) == 10)
 assert(Core.stepSpeed(175, 1, 100, 180, 0.1) == 180)

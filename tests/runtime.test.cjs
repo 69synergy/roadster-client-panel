@@ -4,6 +4,50 @@ const run = require('./lua.cjs');
 const fixture = fs.readFileSync('tests/fixture.lua', 'utf8');
 const BUNDLE = fs.readFileSync('src/main.client.luau', 'utf8');
 function scenario(code) { run(fixture + '\n' + code, { BUNDLE }); }
+test('runtime: collector respects game mode, ignores sparkle, approaches coins and stops cleanly', () => scenario(`
+Launch()
+local coins = Instance.new("Folder")
+coins.Name, coins.Parent = "LocalCoins", workspace
+local sparkle = Instance.new("Part")
+sparkle.Name, sparkle.Parent, sparkle.Position = "CoinSparkle", coins, Vector3.new(1,0,0)
+local coin = Instance.new("Part")
+coin.Name, coin.Parent, coin.Position = "Coin", coins, Vector3.new(100,0,0)
+Set("speed", true)
+Set("farm", true)
+assert(UI.speed.value == false)
+Run.PreSimulation:Fire(0.1)
+assert(Chassis.AssemblyLinearVelocity.Magnitude == 0)
+Player:SetAttribute("ClientMode", "Driving")
+Run.PreSimulation:Fire(0.1)
+assert(Chassis.AssemblyLinearVelocity.X == 60)
+assert(Chassis:FindFirstChild("RoadsterHubLift"))
+Chassis.Position = Vector3.new(98,0,0)
+Run.PreSimulation:Fire(0.1)
+assert(Chassis.AssemblyLinearVelocity.X == 4)
+coin:Destroy()
+Run.PreSimulation:Fire(0.1)
+assert(Chassis.AssemblyLinearVelocity.Magnitude == 0)
+Run.Heartbeat:Fire(0.25)
+assert(string.find(UI["Collection status"].text, "Nearby disappearances observed: 1", 1, true))
+Click("Stop collection")
+assert(not Chassis:FindFirstChild("RoadsterHubLift"))
+assert(UI.farm.value == false)
+`));
+test('runtime: collector pauses on seat exit and unload removes lift', () => scenario(`
+Launch()
+Player:SetAttribute("ClientMode", "Driving")
+Set("farm", true)
+Run.PreSimulation:Fire(0.1)
+assert(Chassis:FindFirstChild("RoadsterHubLift"))
+Seat.Occupant = nil
+Run.PreSimulation:Fire(0.1)
+assert(not Chassis:FindFirstChild("RoadsterHubLift"))
+Seat.Occupant = Humanoid
+Run.PreSimulation:Fire(0.1)
+Click("Unload hub")
+assert(not Chassis:FindFirstChild("RoadsterHubLift"))
+assert(Run.PreSimulation:count() == 0)
+`));
 test('runtime: defaults do not mutate velocity; assist requires owner and occupied driver seat', () => scenario(`
 Launch()
 Run.PreSimulation:Fire(0.1)
